@@ -1,0 +1,256 @@
+name: Mirror Upstream Issues
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes (UTC)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log intended changes without mutating"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: mirror-upstream-issues
+  cancel-in-progress: true
+
+env:
+  # Upstream (source) repository owner/name
+  UPSTREAM_REPO: nhoizey/vscode-gremlins
+  # Marker used to identify mirrored issues and keep runs idempotent
+  BACKLINK_PREFIX: Mirror of upstream issue
+  # Label applied to all mirrored issues for efficient lookups
+  MIRROR_LABEL: upstream-mirror
+  # Whether to sync title/body edits from upstream ("true"/"false")
+  SYNC_TITLE_BODY: "true"
+  # Whether to preserve extra destination labels in addition to upstream ones
+  PRESERVE_EXTRA_LABELS: "true"
+  # Whether to sync milestones and lock state
+  SYNC_MILESTONE: "true"
+  SYNC_LOCK: "true"
+  # Max number of changes (creates/updates) per run; 0 = unlimited
+  MAX_CHANGES: "25"
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror issues, sync state/labels/milestones
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const upstream = process.env.UPSTREAM_REPO;
+            if (!upstream || !upstream.includes('/')) {
+              throw new Error('env.UPSTREAM_REPO must be set as "owner/repo"');
+            }
+            const [uOwner, uRepo] = upstream.split('/');
+            const dOwner = context.repo.owner;
+            const dRepo = context.repo.repo;
+            const backlinkPrefix = process.env.BACKLINK_PREFIX || 'Mirror of upstream issue';
+            const mirrorLabel = process.env.MIRROR_LABEL || 'upstream-mirror';
+            const upstreamRepoLabel = `upstream:${uOwner}/${uRepo}`;
+            const syncTitleBody = (process.env.SYNC_TITLE_BODY || 'false').toLowerCase() === 'true';
+            const preserveExtraLabels = (process.env.PRESERVE_EXTRA_LABELS || 'false').toLowerCase() === 'true';
+            const syncMilestone = (process.env.SYNC_MILESTONE || 'true').toLowerCase() === 'true';
+            const syncLock = (process.env.SYNC_LOCK || 'true').toLowerCase() === 'true';
+            const dryRun = (core.getInput('dry_run') || 'false').toLowerCase() === 'true';
+            const per_page = 100;
+
+            core.info(`Upstream: ${uOwner}/${uRepo} → Destination: ${dOwner}/${dRepo}`);
+
+            const maxChanges = parseInt(process.env.MAX_CHANGES || '0', 10) || 0; // 0 => unlimited
+            let changes = 0;
+            async function maybeRun(fn, desc, countAsChange = true) {
+              if (maxChanges && changes >= maxChanges) { core.warning(`[cap] Skipped: ${desc}`); return { data: {} }; }
+              if (dryRun) { core.info(`[dry-run] ${desc}`); if (countAsChange) changes++; return { data: {} }; }
+              core.info(desc);
+              const res = await fn();
+              if (countAsChange) changes++;
+              return res;
+            }
+
+            // --- 1) Sync repository labels (create/update) ---
+            const upstreamLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { owner: uOwner, repo: uRepo, per_page }
+            );
+            const dstLabels = await github.paginate(
+              github.rest.issues.listLabelsForRepo,
+              { owner: dOwner, repo: dRepo, per_page }
+            );
+            const dstByName = new Map(dstLabels.map(l => [l.name, l]));
+            for (const ul of upstreamLabels) {
+              if (maxChanges && changes >= maxChanges) break;
+              const dl = dstByName.get(ul.name);
+              const uColor = (ul.color || 'ededed').toLowerCase();
+              const uDesc = ul.description || '';
+              if (!dl) {
+                await maybeRun(() => github.rest.issues.createLabel({
+                  owner: dOwner,
+                  repo: dRepo,
+                  name: ul.name,
+                  color: uColor,
+                  description: uDesc
+                }), `Create label: ${ul.name}`);
+              } else {
+                const dColor = (dl.color || '').toLowerCase();
+                const dDesc = dl.description || '';
+                if (dColor !== uColor || dDesc !== uDesc) {
+                  await maybeRun(() => github.rest.issues.updateLabel({
+                    owner: dOwner,
+                    repo: dRepo,
+                    name: dl.name,
+                    color: uColor,
+                    description: uDesc
+                  }), `Update label: ${ul.name}`);
+                }
+              }
+            }
+
+            // Ensure mirror helper labels exist in destination
+            async function ensureLabel(name, color, description) {
+              const existing = dstByName.get(name);
+              if (!existing) {
+                await maybeRun(() => github.rest.issues.createLabel({ owner: dOwner, repo: dRepo, name, color, description }), `Create helper label: ${name}`);
+                dstByName.set(name, { name, color, description });
+              }
+            }
+            await ensureLabel(mirrorLabel, 'bfe5bf', 'Mirrored from upstream; managed by workflow');
+            await ensureLabel(upstreamRepoLabel, 'c5def5', 'Source repository of mirrored issues');
+
+            // --- Helper: build mapping of upstream issue → dst issue (label-based) ---
+            const mirroredMap = new Map(); // upstreamNumber -> { dstNumber, dstState, dstTitle, dstBody }
+            const dstMirrors = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: dOwner, repo: dRepo, state: 'all', labels: mirrorLabel, per_page }
+            );
+            const linkRe = new RegExp(`${backlinkPrefix} https://github.com/${uOwner}/${uRepo}/issues/(\\d+)`);
+            for (const dstIssue of dstMirrors) {
+              const body = dstIssue.body || '';
+              const m = body.match(linkRe);
+              if (!m) continue;
+              const upNum = parseInt(m[1], 10);
+              if (!Number.isFinite(upNum)) continue;
+              if (!mirroredMap.has(upNum)) {
+                mirroredMap.set(upNum, { dstNumber: dstIssue.number, dstState: dstIssue.state, dstTitle: dstIssue.title, dstBody: body });
+              }
+            }
+
+            // --- 2) Mirror new upstream open issues (create if missing) ---
+            const upstreamOpen = (await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner: uOwner, repo: uRepo, state: 'open', per_page, sort: 'created', direction: 'asc' }
+            )).filter(i => !i.pull_request);
+
+            for (const ui of upstreamOpen) {
+              if (maxChanges && changes >= maxChanges) break;
+              if (mirroredMap.has(ui.number)) continue; // already mirrored
+              const link = `https://github.com/${uOwner}/${uRepo}/issues/${ui.number}`;
+              const labelNames = (ui.labels || [])
+                .map(l => typeof l === 'string' ? l : l.name)
+                .filter(Boolean);
+              const body = `${ui.body || ''}\n\n---\n${backlinkPrefix} ${link}`;
+              const created = await maybeRun(() => github.rest.issues.create({
+                owner: dOwner,
+                repo: dRepo,
+                title: ui.title,
+                body,
+                labels: [...labelNames, mirrorLabel, upstreamRepoLabel],
+              }), `Create mirror for upstream #${ui.number}`);
+              mirroredMap.set(ui.number, { dstNumber: created.data.number, dstState: created.data.state, dstTitle: ui.title, dstBody: body });
+            }
+
+            // --- 3) Sync state, labels, title/body, milestone, and lock for all mirrored issues ---
+            for (const [upNum, info] of mirroredMap.entries()) {
+              if (maxChanges && changes >= maxChanges) break;
+              try {
+                const up = (await github.rest.issues.get({ owner: uOwner, repo: uRepo, issue_number: upNum })).data;
+                if (up.pull_request) continue; // skip PRs that slipped through
+
+                // State sync (with reason on close)
+                const desiredState = up.state; // 'open' | 'closed'
+                if (info.dstState !== desiredState) {
+                  await maybeRun(() => github.rest.issues.update({
+                    owner: dOwner,
+                    repo: dRepo,
+                    issue_number: info.dstNumber,
+                    state: desiredState,
+                    state_reason: desiredState === 'closed' ? (up.state_reason || undefined) : undefined
+                  }), `Update state for mirror of upstream #${upNum} → ${desiredState}${up.state_reason ? ` (${up.state_reason})` : ''}`);
+                }
+
+                // Labels sync
+                const upLabelNames = (up.labels || [])
+                  .map(l => typeof l === 'string' ? l : l.name)
+                  .filter(Boolean);
+                let newLabels = [...new Set([...upLabelNames, mirrorLabel, upstreamRepoLabel])];
+                if (preserveExtraLabels) {
+                  const dstIssue = (await github.rest.issues.get({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber })).data;
+                  const dstNames = (dstIssue.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean);
+                  newLabels = [...new Set([...dstNames, ...newLabels])];
+                }
+                await maybeRun(() => github.rest.issues.setLabels({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber, labels: newLabels }), `Sync labels for mirror of upstream #${upNum}`);
+
+                // Title/body sync
+                if (syncTitleBody) {
+                  const link = `https://github.com/${uOwner}/${uRepo}/issues/${up.number}`;
+                  const desiredBody = `${up.body || ''}\n\n---\n${backlinkPrefix} ${link}`;
+                  if (info.dstTitle !== up.title || info.dstBody !== desiredBody) {
+                    await maybeRun(() => github.rest.issues.update({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber, title: up.title, body: desiredBody }), `Update title/body for mirror of upstream #${upNum}`);
+                  }
+                }
+
+                // Milestone sync
+                if (syncMilestone) {
+                  const upMs = up.milestone;
+                  const dstIssue = (await github.rest.issues.get({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber })).data;
+                  const dstMsTitle = dstIssue.milestone ? dstIssue.milestone.title : null;
+                  const upMsTitle = upMs ? upMs.title : null;
+                  if (upMsTitle !== dstMsTitle) {
+                    let milestoneNumber = null;
+                    if (upMs) {
+                      const dstMilestones = await github.paginate(github.rest.issues.listMilestones, { owner: dOwner, repo: dRepo, state: 'all', per_page });
+                      const found = dstMilestones.find(m => m.title === upMs.title);
+                      if (found) {
+                        milestoneNumber = found.number;
+                        const needUpdate = (found.state !== upMs.state) || ((found.description || '') !== (upMs.description || '')) || ((found.due_on || '') !== (upMs.due_on || ''));
+                        if (needUpdate) {
+                          await maybeRun(() => github.rest.issues.updateMilestone({ owner: dOwner, repo: dRepo, milestone_number: found.number, state: upMs.state, description: upMs.description || undefined, due_on: upMs.due_on || undefined }), `Update milestone "${upMs.title}"`);
+                        }
+                      } else {
+                        const createdMs = await maybeRun(() => github.rest.issues.createMilestone({ owner: dOwner, repo: dRepo, title: upMs.title, state: upMs.state, description: upMs.description || undefined, due_on: upMs.due_on || undefined }), `Create milestone "${upMs.title}` + '"');
+                        milestoneNumber = createdMs.data.number;
+                      }
+                    }
+                    await maybeRun(() => github.rest.issues.update({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber, milestone: milestoneNumber }), `Sync milestone for mirror of upstream #${upNum} → ${upMsTitle || 'none'}`);
+                  }
+                }
+
+                // Lock state sync
+                if (syncLock) {
+                  const dstIssue = (await github.rest.issues.get({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber })).data;
+                  const needLock = !!up.locked;
+                  if (needLock && !dstIssue.locked) {
+                    await maybeRun(() => github.rest.issues.lock({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber, lock_reason: up.active_lock_reason || undefined }), `Lock mirror of upstream #${upNum}`);
+                  } else if (!needLock && dstIssue.locked) {
+                    await maybeRun(() => github.rest.issues.unlock({ owner: dOwner, repo: dRepo, issue_number: info.dstNumber }), `Unlock mirror of upstream #${upNum}`);
+                  }
+                }
+              } catch (e) {
+                core.warning(`Failed to sync issue #${upNum}: ${e.message}`);
+              }
+            }
+
+            // Show rate remaining for observability
+            try {
+              const rate = (await github.request('GET /rate_limit')).data.rate;
+              core.info(`Rate limit remaining: ${rate.remaining}/${rate.limit}`);
+            } catch {}
+
+            core.info(`Mirror complete. Changes applied: ${changes}${maxChanges ? '/' + maxChanges : ''}`);
